@@ -66,6 +66,9 @@ class AdiCommand:
             # we care only about first action
             action = action[0]
 
+            if action.get('type') != 'submit':
+                continue
+
             # Where are we targeting the package
             if len(wanted_requests):
                 source_project = 'wanted'
