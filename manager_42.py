@@ -172,14 +172,22 @@ class UpdateCrawler(object):
         http_PUT(url, data=dst_meta)
         self.packages[project].append(package)
 
+    def _get_vrev(self, project, package, md5):
+        root = ET.fromstring(self._get_source_package(project, package, md5))
+        srcmd5, rev = self.check_source_in_project(project, package, root.get('verifymd5'))
+        root = self.cached_GET(makeurl(self.apiurl,
+                                       ['source', project, package], { 'rev': rev, 'view': 'info'}))
+        root = ET.fromstring(root)
+        return root.get('vrev')
+
     def _link_content(self, sourceprj, sourcepkg, rev):
         root = ET.fromstring(self._get_source_package(sourceprj, sourcepkg, rev))
         srcmd5 = root.get('srcmd5')
         vrev = root.get('vrev')
         if vrev is None:
-            vrev = ''
-        else:
-            vrev = " vrev='{}'".format(vrev)
+            vrev = self._get_vrev(sourceprj, sourcepkg, rev)
+
+        vrev = " vrev='{}'".format(vrev)
         link = "<link project='{}' package='{}' rev='{}'{}/>"
         return link.format(sourceprj, sourcepkg, srcmd5, vrev)
 
@@ -190,9 +198,10 @@ class UpdateCrawler(object):
     def link_packages(self, sourceprj, sourcepkg, sourcerev, targetprj, targetpkg):
         logging.info("update link %s/%s -> %s/%s@%s", targetprj, targetpkg, sourceprj, sourcepkg, sourcerev)
 
+       
         # check do it have pending review request against this package
         if targetpkg in self.pending_requests:
-            logging.info("There is a pending request to %s / %s, ignore!"%(self.from_prj, packages))
+            logging.info("There is a pending request to %s / %s, ignore!"%(self.from_prj, targetpkg))
             return
 
         packages = [ targetpkg ]
@@ -215,6 +224,9 @@ class UpdateCrawler(object):
                 pkgs += s
             if m:
                 pkgs += [m]
+            if project == targetprj:
+                # only remove containers no longer needed
+                pkgs = list(set(pkgs) - set(packages))
             self.remove_packages(project, pkgs)
 
         self.create_package_container(targetprj, targetpkg)
@@ -231,49 +243,59 @@ class UpdateCrawler(object):
 
         self.remove_packages(self.from_prj, packages)
 
-    def _filter_given_packages(self, packages):
-        if packages:
-            return [p for p in packages if p in self.packages[self.from_prj]]
+    def _filter_given_packages(self, packages, project = None):
+        if project is None:
+            project = self.from_prj 
 
-        return self.packages[self.from_prj][:]
+        if packages:
+            return [p for p in packages if p in self.packages[project]]
+
+        return self.packages[project][:]
 
     def crawl(self, given_packages = None):
         """Main method of the class that run the crawler."""
 
-        requests = dict()
-
         self.try_to_find_left_packages(self._filter_given_packages(given_packages))
         self.reload_packages()
-        self.cleanup_and_freeze_links(self.from_prj, self._filter_given_packages(given_packages))
+
+        for p in [ self.from_prj + ":SLE12-Picks", self.from_prj, self.from_prj + ":Factory-Copies" ]:
+            self.cleanup_and_freeze_links(p, self._filter_given_packages(given_packages, project=p))
 
     def check_source_in_project(self, project, package, verifymd5):
         if not package in self.packages[project]:
-            return None
+            return None, None
 
         try:
             his = self.cached_GET(makeurl(self.apiurl,
                                    ['source', project, package, '_history']))
         except urllib2.HTTPError:
-            return None
+            return None, None
 
         his = ET.fromstring(his)
+        historyrevs = dict()
         revs = list()
         for rev in his.findall('revision'):
+            historyrevs[rev.find('srcmd5').text] = rev.get('rev')
             revs.append(rev.find('srcmd5').text)
         revs.reverse()
-        for i in range(min(len(revs), 5)): # check last 5 commits
+        for i in range(min(len(revs), 5)): # check last commits
             srcmd5=revs.pop(0)
             root = self.cached_GET(makeurl(self.apiurl,
                                     ['source', project, package], { 'rev': srcmd5, 'view': 'info'}))
             root = ET.fromstring(root)
             if root.get('verifymd5') == verifymd5:
-                return srcmd5
-        return None
+                return srcmd5, historyrevs[srcmd5]
+        return None, None
 
     # check if we can find the srcmd5 in any of our underlay
     # projects
     def try_to_find_left_packages(self, packages):
-        for package in packages:
+        for package in sorted(packages):
+
+            if not package in self.packages[self.from_prj]:
+                logging.info("Package already gone %s" % package)
+                continue
+
             root = ET.fromstring(self._get_source_package(self.from_prj, package, None))
             linked = root.find('linked')
             if not linked is None and linked.get('package') != package:
@@ -283,7 +305,7 @@ class UpdateCrawler(object):
             logging.debug("check where %s came from", package)
             foundit = False
             for project in self.project_preference_order:
-                srcmd5 = self.check_source_in_project(project, package, root.get('verifymd5'))
+                srcmd5, rev = self.check_source_in_project(project, package, root.get('verifymd5'))
                 if srcmd5:
                     logging.debug('%s -> %s', package, project)
                     self.link_packages(project, package, srcmd5, self.project_mapping[project], package)
@@ -328,6 +350,9 @@ class UpdateCrawler(object):
         rev = link.get('rev')
         # XXX: magic number?
         if rev and len(rev) > 5:
+	    if link.get('vrev') is None or link.get('vrev') == 'None':
+                link = self._link_content(link.get('project'), link.get('package'), rev)
+                self.upload_link(project, package, link)
             return True
         lpackage = link.get('package') or package
         if not link.get('project'):
@@ -345,7 +370,7 @@ class UpdateCrawler(object):
 
     def cleanup_and_freeze_links(self, prj, packages):
         logging.debug("check for links to freeze in %s", prj)
-        for package in packages:
+        for package in sorted(packages):
             try:
                 if self.freeze_link(prj, package) == False:
                     logging.error('invalid link %s/%s', prj, package)
@@ -457,7 +482,7 @@ if __name__ == '__main__':
 
     if args.dry:
         def dryrun(t, *args, **kwargs):
-            return lambda *args, **kwargs: logging.debug("dryrun %s %s %s", t, args, str(kwargs)[:30])
+            return lambda *args, **kwargs: logging.debug("dryrun %s %s %s", t, args, str(kwargs)[:200])
 
         http_POST = dryrun('POST')
         http_PUT = dryrun('PUT')
