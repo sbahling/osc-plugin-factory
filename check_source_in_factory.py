@@ -72,7 +72,7 @@ class FactorySourceChecker(ReviewBot.ReviewBot):
             self.logger.error("no upstream project found for {}, can't check".format(target_package))
             return False
 
-        self.review_messages['declined'] = 'Package source not accepted in %s. Fallback to review' % ' or '.join(projects)
+        self.review_messages['declined'] = 'the package needs to be accepted in {} first'.format(' or '.join(projects))
         for project in projects:
             self.logger.info("Checking in project %s" % project)
             good = self._check_project(project, target_package, src_srcinfo.verifymd5)
@@ -83,6 +83,9 @@ class FactorySourceChecker(ReviewBot.ReviewBot):
             good = self._check_requests(project, target_package, src_srcinfo.verifymd5)
             if good:
                 self.logger.info("{} already reviewed for {}".format(target_package, project))
+
+        if not good:
+            self.logger.info('{} failed source submission check'.format(target_package))
 
         return good
 
